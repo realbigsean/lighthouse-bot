@@ -1,0 +1,6 @@
+python-dotenv
+mattermostdriver
+PyGithub
+apscheduler
+pytz
+openai
