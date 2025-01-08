@@ -143,7 +143,7 @@ class ConsensusBot:
         
         # Set the end time to Wednesday 22:00 UTC
         end_time = next_wednesday.replace(
-            hour=22, 
+            hour=9, 
             minute=0, 
             second=0, 
             microsecond=0
@@ -218,8 +218,8 @@ class ConsensusBot:
 If there are issues you want to talk about that are not listed, please still provide feedback! Focus on things like fork inclusion/exclusion.
 
 Prep Calls:
-- APAC: {(datetime.now(pytz.UTC) + timedelta(days=1)).strftime("%Y-%m-%d %H:%M UTC+8")}
-- Americas: {(datetime.now(pytz.UTC) + timedelta(days=1)).strftime("%Y-%m-%d %H:%M UTC-5")}
+- APAC: {datetime.strftime(end_time, '%Y-%m-%d')} 09:00 UTC
+- Ameristralia: {datetime.strftime(end_time, '%Y-%m-%d')} 22:00 UTC
 
 GitHub Issue: {issue.html_url}
 """
