@@ -133,6 +133,31 @@ class ConsensusBot:
         agenda_summary = await self.summarize_agenda_from_llm(text)
         return agenda_summary
 
+    def calculate_cycle_times(self) -> tuple[datetime, datetime]:
+        """Calculate the end time (Wednesday 22:00 UTC) and reminder time (2 hours before)"""
+        now = datetime.now(pytz.UTC)
+        
+        # Find the next Wednesday
+        days_until_wednesday = (2 - now.weekday()) % 7  # 2 represents Wednesday
+        next_wednesday = now + timedelta(days=days_until_wednesday)
+        
+        # Set the end time to Wednesday 22:00 UTC
+        end_time = next_wednesday.replace(
+            hour=22, 
+            minute=0, 
+            second=0, 
+            microsecond=0
+        )
+        
+        # If we're already past Wednesday 22:00, move to next week
+        if now >= end_time:
+            end_time += timedelta(days=7)
+            
+        # Set reminder time to 2 hours before end time
+        reminder_time = end_time - timedelta(hours=2)
+        
+        return reminder_time, end_time
+
     async def send_dm_to_users(self, message: str) -> None:
         """Send a DM to all users and store post info."""
         for username, user_id in self.user_ids.items():
@@ -172,11 +197,14 @@ class ConsensusBot:
             scheduler.add_job(self.start_consensus_cycle, 'date', run_date=run_time)
             return
 
+        # Calculate reminder and end times
+        reminder_time, end_time = self.calculate_cycle_times()
+
         # We have an agenda and an issue
         self.current_issue = issue
         self.cycle_data = {
             'start_date': datetime.now(pytz.UTC),
-            'deadline': datetime.now(pytz.UTC) + timedelta(days=7),
+            'deadline': end_time,
             'issue_number': issue.number,
             'status': 'collecting'
         }
@@ -186,7 +214,7 @@ class ConsensusBot:
         template = f"""
 {agenda}
 
-**Please provide your input on these agenda items in the next 24hrs.**
+**Please provide your input on these agenda items before {end_time.strftime('%A, %Y-%m-%d %H:%M UTC')}.**
 If there are issues you want to talk about that are not listed, please still provide feedback! Focus on things like fork inclusion/exclusion.
 
 Prep Calls:
@@ -197,15 +225,13 @@ GitHub Issue: {issue.html_url}
 """
         await self.send_dm_to_users(template)
 
-        # Schedule a reminder in 24 hours
-        reminder_time = datetime.now(pytz.UTC) + timedelta(hours=24)
+        # Schedule a reminder 2 hours before end time
         scheduler.add_job(self.send_reminder, 'date', run_date=reminder_time)
-        logging.info("Scheduled reminder in 24 hours")
+        logging.info("Scheduled reminder for %s UTC", reminder_time.strftime('%Y-%m-%d %H:%M'))
 
-        # Schedule aggregation in 48 hours
-        aggregation_time = datetime.now(pytz.UTC) + timedelta(hours=48)
-        scheduler.add_job(self.aggregate_feedback, 'date', run_date=aggregation_time)
-        logging.info("Scheduled aggregation in 48 hours")
+        # Schedule aggregation at end time
+        scheduler.add_job(self.aggregate_feedback, 'date', run_date=end_time)
+        logging.info("Scheduled aggregation for %s UTC", end_time.strftime('%Y-%m-%d %H:%M'))
 
     def user_has_responded(self, username: str) -> bool:
         """Check if the user has responded after the bot's initial message."""
@@ -226,7 +252,9 @@ GitHub Issue: {issue.html_url}
 
     async def send_reminder(self):
         """Send reminder to users who haven't responded yet."""
-        reminder = "⏰ Time is running short to provide your input! Please share your thoughts informally."
+        end_time = self.cycle_data['deadline']
+        reminder = f"⏰ Only 2 hours left to provide your input! The feedback period ends at {end_time.strftime('%H:%M UTC')}. Please share your thoughts informally."
+        
         logging.info("Sending reminder to users who haven't responded.")
         for username, info in self.message_info.items():
             if not self.user_has_responded(username):
@@ -319,7 +347,7 @@ GitHub Issue: {issue.html_url}
             logging.error("Error calling OpenAI API for responses summary: %s", e)
             return "Error occurred while summarizing responses."
 
-async def aggregate_feedback(self):
+    async def aggregate_feedback(self):
         """Aggregate all feedback, providing both an LLM summary and detailed responses."""
         logging.info("Aggregating informal user responses...")
         formatted_responses, structured_responses = self.fetch_user_responses()
@@ -398,4 +426,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
