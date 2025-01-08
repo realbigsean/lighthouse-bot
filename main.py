@@ -9,9 +9,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from github import Github
 from mattermostdriver import Driver
-from openai import AsyncOpenAI  # New Client
+from openai import AsyncOpenAI
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -19,7 +18,7 @@ logging.basicConfig(
 )
 
 class ConsensusBot:
-    def __init__(self, mattermost_url: str, mattermost_token: str, repo_name: str, user_list: list[str], test_mode: bool = False):
+    def __init__(self, mattermost_url: str, mattermost_token: str, repo_name: str, user_list: list[str]):
         # Mattermost setup
         self.driver = Driver({
             'url': mattermost_url,
@@ -43,18 +42,12 @@ class ConsensusBot:
         # We will store the current issue and cycle data once found
         self.current_issue = None
         self.cycle_data = {}
-        # message_info will store info about the initial post for each user: {username: {"id": post_id, "channel_id": ..., "create_at": ...}}
         self.message_info = {}
-
-        # Test mode flag
-        self.test_mode = test_mode
-        logging.info("ConsensusBot initialized. Test mode: %s", self.test_mode)
 
         # OpenAI API Key (must be set in environment)
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
             logging.error("OPENAI_API_KEY not found. LLM summarization will not work.")
-        # Instantiate the AsyncOpenAI client
         self.client = AsyncOpenAI(api_key=self.openai_api_key)
 
     async def find_current_meeting_issue(self):
@@ -108,7 +101,7 @@ class ConsensusBot:
         return combined_text
 
     async def summarize_agenda_from_llm(self, text: str) -> str:
-        """Use the new OpenAI SDK to summarize agenda from given text."""
+        """Use OpenAI to summarize agenda from given text."""
         if not self.openai_api_key:
             logging.error("OpenAI API key not set. Cannot summarize.")
             return "No agenda available (OpenAI API key missing)."
@@ -161,25 +154,21 @@ class ConsensusBot:
                 logging.error("Error sending message to %s: %s", username, e)
 
     async def start_consensus_cycle(self):
-        """Attempt to start the consensus cycle. If no issue or no agenda, retry after some time."""
-        logging.info("Attempting to start consensus cycle...")
+        """Start the consensus cycle. If no issue or no agenda, retry after delay."""
+        logging.info("Starting consensus cycle...")
         issue = await self.find_current_meeting_issue()
 
-        # In test mode, shorter delays
-        no_issue_delay = 5 if self.test_mode else 3600  # 5s vs 1h
-        no_agenda_delay = 5 if self.test_mode else 3600 # 5s vs 1h
-
         if not issue:
-            logging.info("No issue found, will retry in %d seconds...", no_issue_delay)
-            run_time = datetime.now(pytz.UTC) + timedelta(seconds=no_issue_delay)
+            logging.info("No issue found, will retry in 1 hour...")
+            run_time = datetime.now(pytz.UTC) + timedelta(hours=1)
             scheduler.add_job(self.start_consensus_cycle, 'date', run_date=run_time)
             return
 
         # Get agenda from LLM
         agenda = await self.get_agenda_from_issue(issue)
         if not agenda.strip():
-            logging.info("Issue found but could not summarize agenda, will retry in %d seconds...", no_agenda_delay)
-            run_time = datetime.now(pytz.UTC) + timedelta(seconds=no_agenda_delay)
+            logging.info("Issue found but could not summarize agenda, will retry in 1 hour...")
+            run_time = datetime.now(pytz.UTC) + timedelta(hours=1)
             scheduler.add_job(self.start_consensus_cycle, 'date', run_date=run_time)
             return
 
@@ -208,24 +197,18 @@ GitHub Issue: {issue.html_url}
 """
         await self.send_dm_to_users(template)
 
-        reminder_delay = 10 if self.test_mode else 86400   # 10s vs 24h
-        aggregation_delay = 15 if self.test_mode else 172800 # 15s vs 48h
-
-        # Schedule a reminder
-        reminder_time = datetime.now(pytz.UTC) + timedelta(seconds=reminder_delay)
+        # Schedule a reminder in 24 hours
+        reminder_time = datetime.now(pytz.UTC) + timedelta(hours=24)
         scheduler.add_job(self.send_reminder, 'date', run_date=reminder_time)
-        logging.info("Scheduled reminder in %d seconds", reminder_delay)
+        logging.info("Scheduled reminder in 24 hours")
 
-        # Schedule aggregation
-        aggregation_time = self.cycle_data['start_date'] + timedelta(seconds=aggregation_delay)
+        # Schedule aggregation in 48 hours
+        aggregation_time = datetime.now(pytz.UTC) + timedelta(hours=48)
         scheduler.add_job(self.aggregate_feedback, 'date', run_date=aggregation_time)
-        logging.info("Scheduled aggregation in %d seconds", aggregation_delay)
+        logging.info("Scheduled aggregation in 48 hours")
 
     def user_has_responded(self, username: str) -> bool:
-        """
-        Check if the user has responded with at least one message after the bot's initial message.
-        This will consider ANY message in the DM channel posted by the user after the initial bot message.
-        """
+        """Check if the user has responded after the bot's initial message."""
         if username not in self.message_info:
             return False
 
@@ -242,11 +225,10 @@ GitHub Issue: {issue.html_url}
         return False
 
     async def send_reminder(self):
-        """Send reminder after the allotted time, but only if the user has NOT responded."""
+        """Send reminder to users who haven't responded yet."""
         reminder = "⏰ Time is running short to provide your input! Please share your thoughts informally."
         logging.info("Sending reminder to users who haven't responded.")
         for username, info in self.message_info.items():
-            # Check if user responded
             if not self.user_has_responded(username):
                 try:
                     channel_id = info['channel_id']
@@ -262,30 +244,53 @@ GitHub Issue: {issue.html_url}
             else:
                 logging.info("Skipping reminder for %s as they have already responded.", username)
 
-    def fetch_user_responses(self) -> str:
+    def fetch_user_responses(self) -> tuple[str, list[dict]]:
         """
         Fetch all responses from the DM channels.
-        We'll gather all the posts made by users (excluding the bot) after the initial message.
+        Returns both a formatted string of all responses and structured response data.
         """
         all_responses = []
+        structured_responses = []
+        
         for username, info in self.message_info.items():
             channel_id = info['channel_id']
             initial_timestamp = info['create_at']
+            user_responses = []
 
-            # Fetch all posts in channel
             try:
                 posts_data = self.driver.posts.get_posts_for_channel(channel_id)
                 for p_id, post_data in posts_data['posts'].items():
-                    # Consider any user post after the initial bot message
                     if (post_data['user_id'] != self.bot_user_id 
                         and post_data['create_at'] > initial_timestamp):
                         msg = post_data['message'].strip()
                         if msg:
-                            all_responses.append(f"From {username}: {msg}")
+                            timestamp = datetime.fromtimestamp(
+                                post_data['create_at'] / 1000,  # Convert from milliseconds
+                                tz=pytz.UTC
+                            )
+                            user_responses.append({
+                                'message': msg,
+                                'timestamp': timestamp
+                            })
+                            
+                if user_responses:
+                    structured_responses.append({
+                        'username': username,
+                        'responses': sorted(user_responses, key=lambda x: x['timestamp'])
+                    })
+                    
+                    # Format responses for this user
+                    responses_text = [f"### {username}'s Input:"]
+                    for resp in user_responses:
+                        responses_text.append(
+                            f"- {resp['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}\n  {resp['message']}"
+                        )
+                    all_responses.append('\n'.join(responses_text))
+                    
             except Exception as e:
-                logging.error("Error fetching posts for user %s: %s", username, e)
+                logging.error(f"Error fetching posts for user {username}: {e}")
 
-        return "\n".join(all_responses) if all_responses else "No user responses collected."
+        return '\n\n'.join(all_responses) if all_responses else "No user responses collected.", structured_responses
 
     async def summarize_responses_with_llm(self, responses_text: str) -> str:
         """Use OpenAI to summarize the collected informal responses."""
@@ -314,27 +319,49 @@ GitHub Issue: {issue.html_url}
             logging.error("Error calling OpenAI API for responses summary: %s", e)
             return "Error occurred while summarizing responses."
 
-    async def aggregate_feedback(self):
-        """Aggregate all feedback by summarizing the informal user responses via LLM."""
+async def aggregate_feedback(self):
+        """Aggregate all feedback, providing both an LLM summary and detailed responses."""
         logging.info("Aggregating informal user responses...")
-        responses_text = self.fetch_user_responses()
-        summary = await self.summarize_responses_with_llm(responses_text)
+        formatted_responses, structured_responses = self.fetch_user_responses()
+        
+        if not structured_responses:
+            message = "No responses were collected during this feedback cycle."
+            self.send_summary_to_all(message)
+            return
 
-        # Send the summary to each user's DM thread
+        summary = await self.summarize_responses_with_llm(formatted_responses)
+
+        # Create the complete message with both summary and detailed responses
+        complete_message = f"""# Consensus Cycle Summary
+
+## Executive Summary
+{summary}
+
+<details>
+<summary>Click to view all individual responses</summary>
+
+{formatted_responses}
+
+</details>
+"""
+
+        self.send_summary_to_all(complete_message)
+        logging.info("Feedback aggregation complete.")
+
+    def send_summary_to_all(self, message: str):
+        """Send the complete summary to all users' DM threads."""
         for username, info in self.message_info.items():
             try:
                 channel_id = info['channel_id']
                 msg_id = info['id']
                 self.driver.posts.create_post({
                     'channel_id': channel_id,
-                    'message': summary,
+                    'message': message,
                     'root_id': msg_id
                 })
-                logging.info("Sent aggregated summary to %s in channel %s", username, channel_id)
+                logging.info(f"Sent aggregated summary to {username} in channel {channel_id}")
             except Exception as e:
-                logging.error("Error sending summary to %s: %s", username, e)
-
-        logging.info("Feedback aggregation complete.")
+                logging.error(f"Error sending summary to {username}: {e}")
 
 async def main():
     load_dotenv()
@@ -343,16 +370,11 @@ async def main():
     mattermost_token = os.getenv('MATTERMOST_TOKEN')
     repo_name = os.getenv('GITHUB_REPO')
 
-    # Set test_mode based on environment variable
-    test_mode = os.getenv('TEST_MODE', 'false').lower() == 'true'
-    logging.info("Test mode: %s", test_mode)
-
     bot = ConsensusBot(
         mattermost_url=mattermost_url,
         mattermost_token=mattermost_token,
         repo_name=repo_name,
-        user_list=users,
-        test_mode=test_mode
+        user_list=users
     )
 
     global scheduler
