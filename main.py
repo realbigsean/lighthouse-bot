@@ -3,9 +3,15 @@ import os
 import re
 import logging
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple
+import uuid
 
+import aiohttp
 import pytz
+from apscheduler.events import EVENT_JOB_ERROR
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.executors.asyncio import AsyncIOExecutor
 from dotenv import load_dotenv
 from github import Github
 from mattermostdriver import Driver
@@ -17,412 +23,430 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+# Global variable to track the last time the bot started a consensus cycle
+LAST_RUN_TIME = None
+
 class ConsensusBot:
-    def __init__(self, mattermost_url: str, mattermost_token: str, repo_name: str, user_list: list[str]):
-        # Mattermost setup
+    """
+    A bot that manages consensus-building for recurring meetings:
+    - Finds meeting issues on GitHub
+    - Sends DMs to participants for feedback
+    - Aggregates and summarizes responses before regional calls
+    - Handles scheduling across multiple time zones
+    """
+
+    def __init__(self, mattermost_url: str, mattermost_token: str, repo_name: str, user_list: list[str], scheduler: AsyncIOScheduler):
+        """
+        Initialize the bot with necessary connections and configurations.
+
+        Args:
+            mattermost_url: Base URL for Mattermost instance
+            mattermost_token: Authentication token for Mattermost
+            repo_name: GitHub repository name (format: "owner/repo")
+            user_list: List of Mattermost usernames to include
+            scheduler: The AsyncIOScheduler instance for scheduling tasks
+        """
+        # Validate inputs
+        if not all([mattermost_url, mattermost_token, repo_name, user_list, scheduler]):
+            raise ValueError("All configuration parameters must be provided")
+
+        # Store scheduler instance
+        self.scheduler = scheduler
+
+        # Mattermost setup with timeout and retry configuration
         self.driver = Driver({
             'url': mattermost_url,
             'token': mattermost_token,
             'scheme': 'https',
-            'port': 443
+            'port': 443,
+            'timeout': 30
         })
-        self.driver.login()
 
-        # Store the bot's user ID
-        self.bot_user_id = self.driver.users.get_user('me')['id']
+        try:
+            self.driver.login()
+            self.bot_user_id = self.driver.users.get_user('me')['id']
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize Mattermost connection: {e}")
 
-        # GitHub setup - anonymous access for public repo
-        self.github = Github()
-        self.repo = self.github.get_repo(repo_name)
+        # GitHub setup
+        try:
+            self.github = Github(os.getenv("GITHUB_TOKEN"))
+            self.repo = self.github.get_repo(repo_name)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize GitHub connection: {e}")
 
-        # Store user list and their IDs
+        # Rate limiting and concurrency control
+        self.session = aiohttp.ClientSession()
+        self.rate_limiter = asyncio.Semaphore(5)
+
+        # User management
         self.user_list = user_list
         self.user_ids = self._get_user_ids()
 
-        # We will store the current issue and cycle data once found
-        self.current_issue = None
-        self.cycle_data = {}
-        self.message_info = {}
+        # Cycle tracking
+        self.active_cycles: Dict[str, Dict[str, Any]] = {}
 
-        # OpenAI API Key (must be set in environment)
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            logging.error("OPENAI_API_KEY not found. LLM summarization will not work.")
-        self.client = AsyncOpenAI(api_key=self.openai_api_key)
+        # OpenAI setup
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    async def find_current_meeting_issue(self):
-        """Find the most recent consensus or execution layer meeting issue"""
+        # Test mode configuration
+        self.test_mode = os.getenv("TEST_MODE", "false").lower() == "true"
+
+    async def find_current_meeting_issue(self) -> Optional[Any]:
+        """Find the most recent consensus layer meeting issue."""
         try:
-            issues = self.repo.get_issues(state='open', sort='updated', direction='desc')
-            pattern = re.compile(r"^(Consensus-layer Call \d+|Execution Layer Meeting \d+)$")
+            async with self.rate_limiter:
+                issues = self.repo.get_issues(state='open', sort='updated', direction='desc')
+                pattern = re.compile(r"^Consensus-layer Call \d+$")
 
-            for issue in issues:
-                if pattern.match(issue.title):
-                    logging.info("Found meeting issue: %s (Issue #%d)", issue.title, issue.number)
-                    return issue
+                for issue in issues:
+                    if pattern.match(issue.title):
+                        logging.info("Found meeting issue: %s (Issue #%d)", issue.title, issue.number)
+                        return issue
 
-            logging.warning("No matching meeting issue found.")
-            return None
+                logging.warning("No matching consensus meeting issue found.")
+                return None
         except Exception as e:
             logging.error("Error finding meeting issue: %s", e)
             return None
 
     def _get_user_ids(self) -> dict:
-        """Get Mattermost user IDs for all users in the list"""
-        user_ids = {}
+        """Get Mattermost user IDs with caching."""
+        cache = {}
         for username in self.user_list:
             try:
                 user = self.driver.users.get_user_by_username(username)
-                user_ids[username] = user['id']
-                logging.info("Found user ID for %s: %s", username, user['id'])
+                cache[username] = user['id']
             except Exception as e:
-                logging.warning("Could not find user %s: %s", username, e)
-        return user_ids
+                logging.error(f"Failed to get user ID for {username}: {e}")
+        return cache
 
-    def create_dm_channel(self, user_id: str) -> str:
-        """Create or get direct message channel with a user"""
+    async def create_dm_channel(self, user_id: str) -> str:
+        """Create DM channel with retry logic."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self.rate_limiter:
+                    channel = self.driver.channels.create_direct_message_channel([user_id, self.bot_user_id])
+                    return channel['id']
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))
+
+    async def summarize_with_llm(self, text: str, prompt: str) -> str:
+        """Use OpenAI to summarize text with retry logic."""
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                async with self.rate_limiter:
+                    response = await self.client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant that summarizes technical discussions."},
+                            {"role": "user", "content": prompt + "\n\n" + text}
+                        ],
+                        temperature=0.7,
+                        max_tokens=700
+                    )
+                    return response.choices[0].message.content.strip()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error("Error calling OpenAI API: %s", e)
+                    return "Error occurred while summarizing."
+                await asyncio.sleep(1 * (attempt + 1))
+
+    def parse_meeting_time(self, issue_body: str) -> datetime:
+        """
+        Extract meeting time from issue body.
+        Expected format: Meeting Date/Time: Wednesday 2025/01/30 at 14:00 UTC
+        """
+        time_pattern = r"Meeting Date/Time: \[?(\w+ \d{4}/\d{1,2}/\d{1,2} at \d{2}:\d{2} UTC)\]?(?:\(.*\))?"
+        match = re.search(time_pattern, issue_body)
+        if not match:
+            raise ValueError("Could not find meeting time in issue body")
+
+        datetime_str = re.sub(r'^\w+\s+', '', match.group(1))
         try:
-            channel = self.driver.channels.create_direct_message_channel([user_id, self.bot_user_id])
-            logging.info("DM channel created for user_id %s: channel_id %s", user_id, channel['id'])
-            return channel['id']
-        except Exception as e:
-            logging.error("Error creating DM channel: %s", e)
-            return None
+            return datetime.strptime(datetime_str, "%Y/%m/%d at %H:%M UTC").replace(tzinfo=pytz.UTC)
+        except ValueError as e:
+            logging.error("Failed to parse datetime: %s", e)
+            raise
 
-    def get_issue_and_comments_text(self, issue):
-        """Fetch issue body and comments, and return a combined text."""
-        logging.info("Fetching issue body and comments for issue #%d", issue.number)
-        issue_body = issue.body or "No issue body."
-        combined_text = f"Issue Title: {issue.title}\n\nIssue Body:\n{issue_body}\n\nComments:\n"
-        
-        comments = issue.get_comments()
-        for c in comments:
-            combined_text += f"---\n{c.user.login} said:\n{c.body}\n"
-        return combined_text
-
-    async def summarize_agenda_from_llm(self, text: str) -> str:
-        """Use OpenAI to summarize agenda from given text."""
-        if not self.openai_api_key:
-            logging.error("OpenAI API key not set. Cannot summarize.")
-            return "No agenda available (OpenAI API key missing)."
+    def calculate_cycle_times(self, issue) -> Tuple[datetime, datetime, datetime]:
+        """Calculate timing for all cycle phases."""
         try:
-            logging.info("Sending content to OpenAI for agenda summarization...")
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that extracts agenda items from a GitHub issue and its comments."},
-                    {"role": "user", "content": (
-                        "Please read the following GitHub issue and comments, and produce a summary of the agenda items. "
-                        "If there are any relevant links in the issue description or comments, please include them next "
-                        "to the related agenda items. Format the agenda as a bullet point list.\n\n" + text
-                    )}
-                ],
-                temperature=0.7,
-                max_tokens=700
-            )
-            agenda_summary = response.choices[0].message.content.strip()
-            logging.info("Received agenda summary from OpenAI.")
-            return agenda_summary
+            if self.test_mode:
+                now = datetime.now(pytz.UTC)
+                # Example: set calls ~30 seconds in the future for easy testing
+                call_time = now + timedelta(seconds=55980)
+                emea_time = now + timedelta(seconds=30)
+                ameristralia_time = now + timedelta(seconds=30)
+            else:
+                call_time = self.parse_meeting_time(issue.body)
+                emea_time = call_time - timedelta(hours=29)
+                ameristralia_time = call_time - timedelta(hours=16)
+
+            return emea_time, call_time, ameristralia_time
         except Exception as e:
-            logging.error("Error calling OpenAI API for agenda: %s", e)
-            return "Error occurred while summarizing agenda."
+            logging.error(f"Error calculating cycle times: {e}")
+            raise
 
-    async def get_agenda_from_issue(self, issue):
-        """Get a summarized agenda of the issue and comments from LLM."""
-        text = self.get_issue_and_comments_text(issue)
-        agenda_summary = await self.summarize_agenda_from_llm(text)
-        return agenda_summary
+    async def send_dm_to_users(self, message: str, cycle_id: str) -> None:
+        """Send DMs with cycle tracking and error handling."""
+        self.active_cycles[cycle_id] = {
+            'messages': {},
+            'start_time': datetime.now(pytz.UTC)
+        }
 
-    def calculate_cycle_times(self) -> tuple[datetime, datetime]:
-        """Calculate the end time (Wednesday 22:00 UTC) and reminder time (2 hours before)"""
-        now = datetime.now(pytz.UTC)
-        
-        # Find the next Wednesday
-        days_until_wednesday = (2 - now.weekday()) % 7  # 2 represents Wednesday
-        next_wednesday = now + timedelta(days=days_until_wednesday)
-        
-        # Set the end time to Wednesday 22:00 UTC
-        end_time = next_wednesday.replace(
-            hour=9, 
-            minute=0, 
-            second=0, 
-            microsecond=0
-        )
-        
-        # If we're already past Wednesday 22:00, move to next week
-        if now >= end_time:
-            end_time += timedelta(days=7)
-            
-        # Set reminder time to 2 hours before end time
-        reminder_time = end_time - timedelta(hours=2)
-        
-        return reminder_time, end_time
-
-    async def send_dm_to_users(self, message: str) -> None:
-        """Send a DM to all users and store post info."""
         for username, user_id in self.user_ids.items():
             try:
-                channel_id = self.create_dm_channel(user_id)
-                if channel_id:
+                channel_id = await self.create_dm_channel(user_id)
+                async with self.rate_limiter:
                     post = self.driver.posts.create_post({
                         'channel_id': channel_id,
                         'message': message
                     })
-                    # Store initial message info for later reference
-                    self.message_info[username] = {
-                        'id': post['id'],
-                        'channel_id': channel_id,
-                        'create_at': post['create_at']  # This is in milliseconds since epoch
-                    }
-                    logging.info("Message sent to %s in channel %s (post_id %s)", username, channel_id, post['id'])
+
+                self.active_cycles[cycle_id]['messages'][username] = {
+                    'id': post['id'],
+                    'channel_id': channel_id,
+                    'create_at': post['create_at']
+                }
             except Exception as e:
-                logging.error("Error sending message to %s: %s", username, e)
+                logging.error(f"Failed to send DM to {username}: {e}")
 
     async def start_consensus_cycle(self):
-        """Start the consensus cycle. If no issue or no agenda, retry after delay."""
-        logging.info("Starting consensus cycle...")
+        """Start a new consensus cycle with unique tracking ID."""
+        cycle_id = str(uuid.uuid4())
         issue = await self.find_current_meeting_issue()
 
         if not issue:
-            logging.info("No issue found, will retry in 1 hour...")
-            run_time = datetime.now(pytz.UTC) + timedelta(hours=1)
-            scheduler.add_job(self.start_consensus_cycle, 'date', run_date=run_time)
+            # If no issue was found and not in test mode, retry in 1 hour
+            if not self.test_mode:
+                run_time = datetime.now(pytz.UTC) + timedelta(hours=1)
+                self.scheduler.add_job(
+                    self.start_consensus_cycle,
+                    'date',
+                    run_date=run_time
+                )
             return
 
-        # Get agenda from LLM
-        agenda = await self.get_agenda_from_issue(issue)
-        if not agenda.strip():
-            logging.info("Issue found but could not summarize agenda, will retry in 1 hour...")
-            run_time = datetime.now(pytz.UTC) + timedelta(hours=1)
-            scheduler.add_job(self.start_consensus_cycle, 'date', run_date=run_time)
+        # Get and summarize issue content
+        issue_text = issue.body + "\n\nComments:\n" + "\n".join(c.body for c in issue.get_comments())
+        agenda = await self.summarize_with_llm(
+            issue_text,
+            "Extract and summarize the key agenda items from this GitHub issue and its comments. Format as bullet points."
+        )
+
+        try:
+            emea_time, call_time, ameristralia_time = self.calculate_cycle_times(issue)
+        except ValueError as e:
+            logging.error(f"Failed to parse meeting time: {e}")
             return
-
-        # Calculate reminder and end times
-        reminder_time, end_time = self.calculate_cycle_times()
-
-        # We have an agenda and an issue
-        self.current_issue = issue
-        self.cycle_data = {
-            'start_date': datetime.now(pytz.UTC),
-            'deadline': end_time,
-            'issue_number': issue.number,
-            'status': 'collecting'
-        }
-
-        logging.info("Starting consensus gathering for issue #%d", issue.number)
 
         template = f"""
 {agenda}
 
-**Please provide your input on these agenda items before {end_time.strftime('%A, %Y-%m-%d %H:%M UTC')}.**
-If there are issues you want to talk about that are not listed, please still provide feedback! Focus on things like fork inclusion/exclusion.
+**Please provide your input on these agenda items.**
 
-Prep Calls:
-- APAC: {datetime.strftime(end_time, '%Y-%m-%d')} 09:00 UTC
-- Ameristralia: {datetime.strftime(end_time, '%Y-%m-%d')} 22:00 UTC
+Schedule:
+- EMEA Call: {emea_time.strftime('%Y-%m-%d %H:%M UTC')}
+- Main Call: {call_time.strftime('%Y-%m-%d %H:%M UTC')}
+- Ameristralia Call: {ameristralia_time.strftime('%Y-%m-%d %H:%M UTC')}
 
 GitHub Issue: {issue.html_url}
 """
-        await self.send_dm_to_users(template)
+        await self.send_dm_to_users(template, cycle_id)
 
-        # Schedule a reminder 2 hours before end time
-        scheduler.add_job(self.send_reminder, 'date', run_date=reminder_time)
-        logging.info("Scheduled reminder for %s UTC", reminder_time.strftime('%Y-%m-%d %H:%M'))
+        # Schedule aggregations with cycle ID *directly* in the event loop.
+        self.scheduler.add_job(
+            self.aggregate_feedback,
+            'date',
+            run_date=emea_time,
+            args=["EMEA", cycle_id]
+        )
+        self.scheduler.add_job(
+            self.aggregate_feedback,
+            'date',
+            run_date=ameristralia_time,
+            args=["Ameristralia", cycle_id]
+        )
 
-        # Schedule aggregation at end time
-        scheduler.add_job(self.aggregate_feedback, 'date', run_date=end_time)
-        logging.info("Scheduled aggregation for %s UTC", end_time.strftime('%Y-%m-%d %H:%M'))
+        # Schedule cleanup
+        cleanup_time = call_time + timedelta(hours=1)
+        self.scheduler.add_job(
+            self.cleanup_cycle,
+            'date',
+            run_date=cleanup_time,
+            args=[cycle_id]
+        )
 
-    def user_has_responded(self, username: str) -> bool:
-        """Check if the user has responded after the bot's initial message."""
-        if username not in self.message_info:
-            return False
+    async def fetch_user_responses(self, cycle_id: str) -> str:
+        """Fetch responses for a specific cycle."""
+        if cycle_id not in self.active_cycles:
+            logging.error(f"No active cycle found with ID: {cycle_id}")
+            return "No responses collected."
 
-        channel_id = self.message_info[username]['channel_id']
-        initial_timestamp = self.message_info[username]['create_at']
-        try:
-            posts_data = self.driver.posts.get_posts_for_channel(channel_id)
-            for p_id, post_data in posts_data['posts'].items():
-                # Check if the post is by the user and after the initial message timestamp
-                if post_data['user_id'] != self.bot_user_id and post_data['create_at'] > initial_timestamp:
-                    return True
-        except Exception as e:
-            logging.error("Error checking responses for user %s: %s", username, e)
-        return False
-
-    async def send_reminder(self):
-        """Send reminder to users who haven't responded yet."""
-        end_time = self.cycle_data['deadline']
-        reminder = f"⏰ Only 2 hours left to provide your input! The feedback period ends at {end_time.strftime('%H:%M UTC')}. Please share your thoughts informally."
-        
-        logging.info("Sending reminder to users who haven't responded.")
-        for username, info in self.message_info.items():
-            if not self.user_has_responded(username):
-                try:
-                    channel_id = info['channel_id']
-                    msg_id = info['id']
-                    self.driver.posts.create_post({
-                        'channel_id': channel_id,
-                        'message': reminder,
-                        'root_id': msg_id
-                    })
-                    logging.info("Sent reminder to %s in channel %s", username, channel_id)
-                except Exception as e:
-                    logging.error("Error sending reminder to %s: %s", username, e)
-            else:
-                logging.info("Skipping reminder for %s as they have already responded.", username)
-
-    def fetch_user_responses(self) -> tuple[str, list[dict]]:
-        """
-        Fetch all responses from the DM channels.
-        Returns both a formatted string of all responses and structured response data.
-        """
+        cycle_info = self.active_cycles[cycle_id]
         all_responses = []
-        structured_responses = []
-        
-        for username, info in self.message_info.items():
-            channel_id = info['channel_id']
-            initial_timestamp = info['create_at']
-            user_responses = []
 
+        for username, info in cycle_info['messages'].items():
             try:
-                posts_data = self.driver.posts.get_posts_for_channel(channel_id)
-                for p_id, post_data in posts_data['posts'].items():
-                    if (post_data['user_id'] != self.bot_user_id 
-                        and post_data['create_at'] > initial_timestamp):
-                        msg = post_data['message'].strip()
-                        if msg:
-                            timestamp = datetime.fromtimestamp(
-                                post_data['create_at'] / 1000,  # Convert from milliseconds
-                                tz=pytz.UTC
-                            )
-                            user_responses.append({
-                                'message': msg,
-                                'timestamp': timestamp
-                            })
-                            
-                if user_responses:
-                    structured_responses.append({
-                        'username': username,
-                        'responses': sorted(user_responses, key=lambda x: x['timestamp'])
-                    })
-                    
-                    # Format responses for this user
-                    responses_text = [f"### {username}'s Input:"]
-                    for resp in user_responses:
-                        responses_text.append(
-                            f"- {resp['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}\n  {resp['message']}"
-                        )
-                    all_responses.append('\n'.join(responses_text))
-                    
+                async with self.rate_limiter:
+                    posts = self.driver.posts.get_posts_for_channel(info['channel_id'])
+
+                responses = [
+                    p['message'] for p in posts['posts'].values()
+                    if (p['user_id'] != self.bot_user_id and
+                        p['create_at'] > info['create_at'] and
+                        not p.get('delete_at'))
+                ]
+
+                if responses:
+                    all_responses.append(f"### {username}'s Input:\n" + "\n".join(responses))
+
             except Exception as e:
-                logging.error(f"Error fetching posts for user {username}: {e}")
+                logging.error(f"Failed to fetch responses for {username}: {e}")
 
-        return '\n\n'.join(all_responses) if all_responses else "No user responses collected.", structured_responses
+        return "\n\n".join(all_responses) if all_responses else "No responses collected."
 
-    async def summarize_responses_with_llm(self, responses_text: str) -> str:
-        """Use OpenAI to summarize the collected informal responses."""
-        if not self.openai_api_key:
-            logging.error("OpenAI API key not set. Cannot summarize responses.")
-            return "No summary available (OpenAI API key missing)."
-        try:
-            logging.info("Sending user responses to OpenAI for summarization...")
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that summarizes user feedback."},
-                    {"role": "user", "content": (
-                        "Below are several informal inputs from different participants. "
-                        "Please provide a concise summary of the main points, concerns, suggestions, and any emerging consensus. "
-                        "Focus on key themes, not individual messages, and be neutral.\n\n" + responses_text
-                    )}
-                ],
-                temperature=0.7,
-                max_tokens=700
-            )
-            summary = response.choices[0].message.content.strip()
-            logging.info("Received summary of user responses from OpenAI.")
-            return summary
-        except Exception as e:
-            logging.error("Error calling OpenAI API for responses summary: %s", e)
-            return "Error occurred while summarizing responses."
+    async def aggregate_feedback(self, phase: str, cycle_id: str):
+        """Aggregate and summarize feedback for a specific cycle phase."""
+        responses = await self.fetch_user_responses(cycle_id)
+        summary = await self.summarize_with_llm(
+            responses,
+            f"Summarize the key points and consensus from these responses for the {phase} call."
+        )
 
-    async def aggregate_feedback(self):
-        """Aggregate all feedback, providing both an LLM summary and detailed responses."""
-        logging.info("Aggregating informal user responses...")
-        formatted_responses, structured_responses = self.fetch_user_responses()
-        
-        if not structured_responses:
-            message = "No responses were collected during this feedback cycle."
-            self.send_summary_to_all(message)
+        cycle_info = self.active_cycles.get(cycle_id, {})
+        if not cycle_info:
+            logging.error(f"No cycle info found for {cycle_id}")
             return
 
-        summary = await self.summarize_responses_with_llm(formatted_responses)
-
-        # Create the complete message with both summary and detailed responses
-        complete_message = f"""# Consensus Cycle Summary
-
-## Executive Summary
-{summary}
-
-<details>
-<summary>Click to view all individual responses</summary>
-
-{formatted_responses}
-
-</details>
-"""
-
-        self.send_summary_to_all(complete_message)
-        logging.info("Feedback aggregation complete.")
-
-    def send_summary_to_all(self, message: str):
-        """Send the complete summary to all users' DM threads."""
-        for username, info in self.message_info.items():
+        for info in cycle_info['messages'].values():
             try:
-                channel_id = info['channel_id']
-                msg_id = info['id']
-                self.driver.posts.create_post({
-                    'channel_id': channel_id,
-                    'message': message,
-                    'root_id': msg_id
-                })
-                logging.info(f"Sent aggregated summary to {username} in channel {channel_id}")
+                async with self.rate_limiter:
+                    summary_post = self.driver.posts.create_post({
+                        'channel_id': info['channel_id'],
+                        'message': f"# Pre-{phase} Call Summary\n\n{summary}"
+                    })
+
+                    parsed_responses = self.parse_responses(responses)
+                    for username, response in parsed_responses.items():
+                        self.driver.posts.create_post({
+                            'channel_id': info['channel_id'],
+                            'message': f"### {username}'s Input:\n{response}",
+                            'root_id': summary_post['id']
+                        })
             except Exception as e:
-                logging.error(f"Error sending summary to {username}: {e}")
+                logging.error(f"Error posting summary: {e}")
+
+    def parse_responses(self, responses_text: str) -> Dict[str, str]:
+        """
+        Dummy method for parsing structured input. Right now, it scans
+        for blocks of the form '### <user>' and returns a dict.
+        """
+        results = {}
+        pattern = r"### (.+?)'s Input:\n(.+?)(?=\n###|$)"
+        matches = re.findall(pattern, responses_text, re.DOTALL)
+        for user, content in matches:
+            results[user.strip()] = content.strip()
+        return results
+
+    async def cleanup_cycle(self, cycle_id: str):
+        """Clean up cycle data after completion."""
+        if cycle_id in self.active_cycles:
+            del self.active_cycles[cycle_id]
+            logging.info(f"Cleaned up cycle {cycle_id}")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.session.close()
+
+def setup_scheduler() -> AsyncIOScheduler:
+    """Configure scheduler with AsyncIOExecutor and error handling."""
+    jobstores = {
+        'default': MemoryJobStore()
+    }
+    executors = {
+        'default': AsyncIOExecutor()
+    }
+    loop = asyncio.get_event_loop()
+
+    scheduler = AsyncIOScheduler(jobstores=jobstores, executors=executors, event_loop=loop)
+
+    def job_error_listener(event):
+        if event.code == EVENT_JOB_ERROR:
+            logging.error(f"Job failed: {event.job_id}", exc_info=event.exception)
+
+    scheduler.add_listener(job_error_listener, EVENT_JOB_ERROR)
+    return scheduler
+
+# -------------------------------------------------------------------
+# New function to prevent running too soon after a previous run
+# -------------------------------------------------------------------
+async def maybe_start_consensus_cycle(bot):
+    global LAST_RUN_TIME
+    now = datetime.now(pytz.UTC)
+
+    # For example, skip if last run was within the last 5 minutes
+    min_interval = timedelta(minutes=5)
+
+    if LAST_RUN_TIME and (now - LAST_RUN_TIME) < min_interval:
+        logging.info(
+            "Skipping start_consensus_cycle because the bot just ran within the last 5 minutes."
+        )
+        return
+
+    await bot.start_consensus_cycle()
+    LAST_RUN_TIME = now
+
 
 async def main():
     load_dotenv()
-    users = os.getenv('MATTERMOST_USERS').split(',')
-    mattermost_url = os.getenv('MATTERMOST_URL')
-    mattermost_token = os.getenv('MATTERMOST_TOKEN')
-    repo_name = os.getenv('GITHUB_REPO')
 
-    bot = ConsensusBot(
-        mattermost_url=mattermost_url,
-        mattermost_token=mattermost_token,
-        repo_name=repo_name,
-        user_list=users
-    )
+    required_vars = ['MATTERMOST_URL', 'MATTERMOST_TOKEN', 'GITHUB_REPO', 'MATTERMOST_USERS']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
-    global scheduler
-    scheduler = AsyncIOScheduler()
+    # Initialize scheduler first
+    scheduler = setup_scheduler()
 
-    # Start cycle every Monday at 9 AM UTC
-    scheduler.add_job(
-        bot.start_consensus_cycle,
-        'cron',
-        day_of_week='mon',
-        hour=9
-    )
+    # Create bot
+    async with ConsensusBot(
+        mattermost_url=os.getenv('MATTERMOST_URL'),
+        mattermost_token=os.getenv('MATTERMOST_TOKEN'),
+        repo_name=os.getenv('GITHUB_REPO'),
+        user_list=os.getenv('MATTERMOST_USERS').split(','),
+        scheduler=scheduler
+    ) as bot:
+        # Start scheduler
+        scheduler.start()
 
-    # Run it immediately on startup
-    await bot.start_consensus_cycle()
+        # Schedule a recurring job for every Monday at 14:00
+        if not bot.test_mode:
+            scheduler.add_job(
+                maybe_start_consensus_cycle,
+                'cron',
+                day_of_week='mon',
+                hour=14,
+                args=[bot]
+            )
 
-    scheduler.start()
+        # Run on startup if enabled
+        if os.getenv("RUN_ON_STARTUP", "false").lower() == "true":
+            await maybe_start_consensus_cycle(bot)
 
-    # Keep running indefinitely
-    await asyncio.Event().wait()
+        try:
+            # Keep the script running forever
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            scheduler.shutdown()
+            logging.info("Bot shutdown complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
